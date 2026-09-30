@@ -17,6 +17,9 @@ from pyspark.sql.types import (
 )
 
 from src.transform.clean_jobs import (
+    DELTA_CATALOG,
+    DELTA_EXTENSION,
+    JobTransformError,
     RawDataNotFoundError,
     UNKNOWN_COMPANY,
     UNSPECIFIED_LOCATION,
@@ -24,6 +27,7 @@ from src.transform.clean_jobs import (
     clean_raw_data,
     create_spark_session,
     find_latest_raw_file,
+    resolve_delta_root,
     write_table,
 )
 
@@ -51,6 +55,26 @@ def spark() -> SparkSession:
 
 def _bronze(spark: SparkSession, rows: list[tuple[object, ...]]):
     return spark.createDataFrame(rows, schema=BRONZE_SCHEMA)
+
+
+def test_resolve_delta_root_local_directory() -> None:
+    root = resolve_delta_root("local")
+    assert root.endswith("data/processed/delta")
+
+
+def test_resolve_delta_root_azure_abfss() -> None:
+    root = resolve_delta_root("azure", account="jobsacct", container="lake")
+    assert root == "abfss://lake@jobsacct.dfs.core.windows.net/processed/delta"
+
+
+def test_resolve_delta_root_azure_requires_coordinates() -> None:
+    with pytest.raises(JobTransformError, match="AZURE_STORAGE_ACCOUNT"):
+        resolve_delta_root("azure", account="", container="")
+
+
+def test_spark_session_enables_delta_lake(spark: SparkSession) -> None:
+    assert spark.conf.get("spark.sql.extensions") == DELTA_EXTENSION
+    assert spark.conf.get("spark.sql.catalog.spark_catalog") == DELTA_CATALOG
 
 
 def test_find_latest_raw_file_uses_timestamp_in_the_name(tmp_path: Path) -> None:
@@ -234,7 +258,7 @@ def test_build_star_schema_links_facts_to_dimensions(spark: SparkSession) -> Non
     assert joined.count() == gold["fct_vacancies"].count()
 
 
-def test_write_table_round_trips_parquet(spark: SparkSession, tmp_path: Path) -> None:
+def test_write_table_round_trips_delta(spark: SparkSession, tmp_path: Path) -> None:
     jobs = _bronze(
         spark,
         [
@@ -252,8 +276,8 @@ def test_write_table_round_trips_parquet(spark: SparkSession, tmp_path: Path) ->
     )
     silver = clean_raw_data(jobs)
     destination = tmp_path / "silver" / "jobs"
-    write_table(silver, destination, "parquet")
+    write_table(silver, destination)
 
-    loaded = spark.read.parquet(destination.as_posix())
+    loaded = spark.read.format("delta").load(destination.as_posix())
     assert loaded.count() == 1
     assert loaded.collect()[0].description == "Pipelines"

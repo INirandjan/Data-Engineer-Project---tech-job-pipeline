@@ -6,14 +6,14 @@ modeled as a star schema:
 * ``dim_company`` and ``dim_location`` hold generated surrogate keys
 * ``fct_vacancies`` stores one row per vacancy with foreign keys
 
-Tables are written under ``data/processed``. Delta Lake is used when the
-``delta`` package is installed; otherwise the writer falls back to Parquet.
+Tables are Delta Lake tables. ``STORAGE_TYPE=local`` writes them under
+``data/processed/delta``. ``STORAGE_TYPE=azure`` writes the same layout to
+``abfss://<container>@<account>.dfs.core.windows.net/processed/delta``.
 """
 
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import logging
 import os
 import shutil
@@ -21,6 +21,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from delta.pip_utils import configure_spark_with_delta_pip
+from dotenv import load_dotenv
 from pyspark.sql import Column, DataFrame, SparkSession, Window
 from pyspark.sql import functions as F
 from pyspark.sql.types import DateType, TimestampNTZType, TimestampType
@@ -30,6 +32,9 @@ logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RAW_DIR = PROJECT_ROOT / "data" / "raw"
 DEFAULT_PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
+DEFAULT_DELTA_ROOT = DEFAULT_PROCESSED_DIR / "delta"
+DELTA_EXTENSION = "io.delta.sql.DeltaSparkSessionExtension"
+DELTA_CATALOG = "org.apache.spark.sql.delta.catalog.DeltaCatalog"
 RAW_FILE_PATTERN = "jobs_raw_*.json"
 TITLE_KEYWORDS: tuple[str, ...] = ("data", "engineer", "developer", "python")
 UNKNOWN_COMPANY = "Unknown"
@@ -81,11 +86,6 @@ def configure_logging(level: int = logging.INFO) -> None:
         format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
         datefmt="%Y-%m-%dT%H:%M:%S%z",
     )
-
-
-def delta_is_available() -> bool:
-    """Return whether the Delta Lake Python package can be imported."""
-    return importlib.util.find_spec("delta") is not None
 
 
 def assert_java_available() -> None:
@@ -316,12 +316,92 @@ def ensure_windows_local_filesystem() -> str | None:
     return classes.as_posix()
 
 
-def create_spark_session(
-    app_name: str = "tech-job-transform",
+def _env_value(explicit: str | None, name: str) -> str:
+    """Prefer an explicit argument, otherwise read ``name`` from the environment."""
+    if explicit is not None:
+        return explicit.strip()
+    return (os.getenv(name) or "").strip()
+
+
+def load_storage_settings() -> None:
+    """Load ``.env`` without overriding variables already set in the process."""
+    load_dotenv(PROJECT_ROOT / ".env")
+
+
+def resolve_delta_root(
+    storage_type: str | None = None,
     *,
-    enable_delta: bool = False,
-) -> SparkSession:
-    """Start a local Spark session for the batch transform."""
+    account: str | None = None,
+    container: str | None = None,
+) -> str:
+    """Return the Delta root for local disk or Azure Data Lake Storage.
+
+    ``STORAGE_TYPE=local`` uses ``data/processed/delta``.
+    ``STORAGE_TYPE=azure`` uses
+    ``abfss://<container>@<account>.dfs.core.windows.net/processed/delta``.
+    """
+    load_storage_settings()
+    selected = _env_value(storage_type, "STORAGE_TYPE").lower() or "local"
+    if selected == "local":
+        return DEFAULT_DELTA_ROOT.as_posix()
+    if selected != "azure":
+        raise JobTransformError(
+            f"Unsupported STORAGE_TYPE {selected!r}. Use 'local' or 'azure'."
+        )
+
+    account_name = _env_value(account, "AZURE_STORAGE_ACCOUNT")
+    container_name = _env_value(container, "AZURE_STORAGE_CONTAINER")
+    if not account_name or not container_name:
+        raise JobTransformError(
+            "STORAGE_TYPE=azure requires AZURE_STORAGE_ACCOUNT and "
+            "AZURE_STORAGE_CONTAINER."
+        )
+    return (
+        f"abfss://{container_name}@{account_name}.dfs.core.windows.net/"
+        "processed/delta"
+    )
+
+
+def _configure_azure_storage(builder: SparkSession.Builder) -> tuple[SparkSession.Builder, list[str]]:
+    """Add ABFS credentials when the run targets Azure storage.
+
+    Returns the builder and any extra Maven packages the session needs.
+    A shared key is optional: Azure Databricks can supply a managed identity
+    instead.
+    """
+    load_storage_settings()
+    if os.getenv("STORAGE_TYPE", "local").strip().lower() != "azure":
+        return builder, []
+
+    account = os.getenv("AZURE_STORAGE_ACCOUNT", "").strip()
+    key = os.getenv("AZURE_STORAGE_ACCOUNT_KEY", "").strip()
+    packages = [f"org.apache.hadoop:hadoop-azure:{_hadoop_version()}"]
+    if account and key:
+        host = f"{account}.dfs.core.windows.net"
+        builder = builder.config(
+            f"spark.hadoop.fs.azure.account.auth.type.{host}",
+            "SharedKey",
+        ).config(
+            f"spark.hadoop.fs.azure.account.key.{host}",
+            key,
+        )
+        logger.info("Configured shared-key auth for abfss on %s", host)
+    else:
+        logger.info(
+            "STORAGE_TYPE=azure without a shared key; "
+            "the session expects managed identity or workspace credentials."
+        )
+    return builder, packages
+
+
+def _hadoop_version() -> str:
+    """Return the Hadoop version bundled with this PySpark install."""
+    stem = _hadoop_client_jar().name.removesuffix(".jar")
+    return stem.rsplit("-", 1)[-1]
+
+
+def create_spark_session(app_name: str = "tech-job-transform") -> SparkSession:
+    """Start a local Spark session with the Delta Lake extensions enabled."""
     assert_java_available()
     ensure_windows_hadoop_home()
     local_filesystem = ensure_windows_local_filesystem()
@@ -341,6 +421,8 @@ def create_spark_session(
         .config("spark.sql.warehouse.dir", warehouse.as_posix())
         .config("spark.driver.host", "localhost")
         .config("spark.driver.bindAddress", "127.0.0.1")
+        .config("spark.sql.extensions", DELTA_EXTENSION)
+        .config("spark.sql.catalog.spark_catalog", DELTA_CATALOG)
     )
     if local_filesystem:
         builder = (
@@ -348,15 +430,11 @@ def create_spark_session(
             .config("spark.executor.extraClassPath", local_filesystem)
             .config("spark.hadoop.fs.file.impl", "org.techjob.LocalFileSystem")
         )
-    if enable_delta:
-        builder = builder.config(
-            "spark.sql.extensions",
-            "io.delta.sql.DeltaSparkSessionExtension",
-        ).config(
-            "spark.sql.catalog.spark_catalog",
-            "org.apache.spark.sql.delta.catalog.DeltaCatalog",
-        )
-
+    builder, extra_packages = _configure_azure_storage(builder)
+    builder = configure_spark_with_delta_pip(
+        builder,
+        extra_packages=extra_packages or None,
+    )
     spark = builder.getOrCreate()
     spark.sparkContext.setLogLevel("ERROR")
     return spark
@@ -554,42 +632,32 @@ def build_star_schema(silver: DataFrame) -> dict[str, DataFrame]:
     }
 
 
-def choose_format(requested: str | None) -> str:
-    """Pick Delta when requested or installed, otherwise Parquet."""
-    if requested == "parquet":
-        return "parquet"
-    if requested == "delta" or (requested is None and delta_is_available()):
-        if not delta_is_available():
-            raise JobTransformError(
-                "delta-spark is not installed. Re-run with --format parquet."
-            )
-        return "delta"
-    logger.info("delta-spark is not installed; writing Parquet")
-    return "parquet"
+def _storage_target(root: str, relative_path: str) -> str:
+    """Join a Delta root and a table path without breaking ``abfss://``."""
+    return f"{root.rstrip('/')}/{relative_path.strip('/')}"
 
 
-def write_table(frame: DataFrame, destination: Path, file_format: str) -> None:
-    """Overwrite one table directory in ``file_format``."""
-    writer = frame.write.mode("overwrite")
-    target = destination.as_posix()
-    if file_format == "delta":
-        writer.format("delta").save(target)
-        return
-    if file_format != "parquet":
-        raise JobTransformError(f"Unsupported table format: {file_format}")
-    writer.parquet(target)
+def write_table(frame: DataFrame, destination: str | Path) -> None:
+    """Overwrite one Delta table at ``destination``."""
+    target = destination.as_posix() if isinstance(destination, Path) else destination
+    (
+        frame.write.format("delta")
+        .mode("overwrite")
+        .option("overwriteSchema", "true")
+        .save(target)
+    )
 
 
 def run_transformation(
     spark: SparkSession,
     raw_dir: Path = DEFAULT_RAW_DIR,
-    output_dir: Path = DEFAULT_PROCESSED_DIR,
-    file_format: str = "parquet",
+    output_root: str | None = None,
 ) -> dict[str, int]:
-    """Read the latest bronze file and write silver plus gold tables.
+    """Read the latest bronze file and write silver plus gold Delta tables.
 
     Returns a mapping of output-relative path to row count.
     """
+    root = output_root or resolve_delta_root()
     latest = find_latest_raw_file(raw_dir)
     raw_jobs = read_raw_jobs(spark, latest)
     silver = clean_raw_data(raw_jobs).cache()
@@ -606,14 +674,13 @@ def run_transformation(
         for relative_path, frame in tables.items():
             materialized = frame.cache()
             row_count = materialized.count()
-            destination = output_dir / relative_path
+            destination = _storage_target(root, relative_path)
             logger.info(
-                "Writing %s row(s) as %s to %s",
+                "Writing %s row(s) as delta to %s",
                 row_count,
-                file_format,
                 destination,
             )
-            write_table(materialized, destination, file_format)
+            write_table(materialized, destination)
             counts[relative_path] = row_count
             if materialized is not silver:
                 materialized.unpersist()
@@ -628,7 +695,7 @@ def run_transformation(
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Build the CLI for one silver/gold batch."""
     parser = argparse.ArgumentParser(
-        description="Clean raw job JSON into silver and gold Parquet tables."
+        description="Clean raw job JSON into silver and gold Delta tables."
     )
     parser.add_argument(
         "--raw-dir",
@@ -639,14 +706,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=DEFAULT_PROCESSED_DIR,
-        help="Processed lake directory (default: %(default)s).",
-    )
-    parser.add_argument(
-        "--format",
-        choices=("parquet", "delta"),
         default=None,
-        help="Output format. Defaults to delta when installed, else parquet.",
+        help=(
+            "Delta root directory. Defaults to data/processed/delta, "
+            "or an abfss:// path when STORAGE_TYPE=azure."
+        ),
     )
     return parser.parse_args(argv)
 
@@ -656,14 +720,17 @@ def main(argv: list[str] | None = None) -> int:
     configure_logging()
     args = parse_args(argv)
     try:
-        file_format = choose_format(args.format)
-        spark = create_spark_session(enable_delta=file_format == "delta")
+        output_root = (
+            args.output_dir.as_posix()
+            if args.output_dir is not None
+            else resolve_delta_root()
+        )
+        spark = create_spark_session()
         try:
             run_transformation(
                 spark,
                 raw_dir=args.raw_dir,
-                output_dir=args.output_dir,
-                file_format=file_format,
+                output_root=output_root,
             )
         finally:
             spark.stop()
