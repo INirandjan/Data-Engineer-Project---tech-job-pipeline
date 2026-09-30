@@ -43,6 +43,10 @@ spark-warehouse/
 derby.log
 .hadoop/
 
+# Streamlit secrets and local cache
+.streamlit/secrets.toml
+.streamlit/cache/
+
 # Editors and OS
 .idea/
 .vscode/
