@@ -2,6 +2,8 @@ name: CI
 
 on:
   push:
+    branches:
+      - main
   pull_request:
 
 jobs:
@@ -11,21 +13,30 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Set up Java
+      - name: Set up OpenJDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      - name: Set up Python
+      - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install --upgrade -r requirements.txt
+
+      - name: Check PySpark runtime
+        run: |
+          java -version
+          python --version
+          python -c "import os, pyspark; print('JAVA_HOME=' + os.environ['JAVA_HOME']); print('pyspark', pyspark.__version__)"
 
       - name: Run unit tests
-        run: pytest
+        run: |
+          set -o pipefail
+          python -m pytest -q --tb=short | tee pytest-output.txt
+          grep -q "17 passed" pytest-output.txt
