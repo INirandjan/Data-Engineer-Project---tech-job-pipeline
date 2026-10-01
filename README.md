@@ -8,6 +8,10 @@
 [![Streamlit](https://img.shields.io/badge/Streamlit-dashboard-FF4B4B?logo=streamlit&logoColor=white)](https://streamlit.io/)
 [![Azure](https://img.shields.io/badge/Azure-ready-0078D4?logo=microsoftazure&logoColor=white)](https://azure.microsoft.com/)
 
+## Live Demo
+
+🚀 **Live Demo:** [Bekijk het interactieve Streamlit Data Dashboard](https://data-engineer-project---tech-job-pipeline-nze7yci7bypihjtxkt6v.streamlit.app/)
+
 Deze pipeline haalt remote IT-vacatures op, schoont ze op en modelleert ze als een Delta Lake-sterschema. Lokaal landen de lagen onder `data/`. Met `STORAGE_TYPE=azure` schrijft dezelfde job naar Azure Data Lake Storage via `abfss://`, zodat de transformatie zonder codewijziging op Databricks kan draaien.
 
 ## Architectuur
@@ -48,7 +52,11 @@ flowchart LR
 | Bronze | Ruwe API-response, zonder transformatie | `data/raw/jobs_raw_<UTC>.json` |
 | Silver | Relevante kolommen, HTML eruit, titel-filter, timestamps | `data/processed/delta/silver/jobs` |
 | Gold | Sterschema met surrogaatsleutels | `data/processed/delta/gold/` |
-| Serve | Totalen, categorieën, locaties en een zoekbare tabel. DuckDB leest Gold; zonder die bestanden schoont Python bronze JSON, de live API of `data/sample` op | `streamlit run src/dashboard/app.py` |
+| Serve | Totalen, categorieën, locaties en een zoekbare tabel. DuckDB leest de Gold-laag of het Parquet-sample | `streamlit run src/dashboard/app.py` |
+
+### Presentation layer
+
+The Gold layer results (700+ processed jobs) are rendered live using DuckDB and Streamlit Cloud at [Live Dashboard Link](https://data-engineer-project---tech-job-pipeline-nze7yci7bypihjtxkt6v.streamlit.app/).
 
 ## Medallion-patroon
 
@@ -109,7 +117,7 @@ Het dashboard heeft die JDK niet nodig en importeert geen modules uit `src`. Het
 
 Zet het main file op `src/dashboard/app.py`. Python komt uit `runtime.txt` (3.12). Dependencies komen uit `requirements.txt`. `packages.txt` installeert `libgomp1`, de OpenMP-runtime waar DuckDB op Linux aan linkt. PySpark staat in `requirements.txt` voor de lokale transformatie en CI, maar `app.py` importeert het niet.
 
-`data/raw` en `data/processed` gaan niet mee in git. `data/sample/gold_jobs_sample.parquet` wel. Op Cloud leest het dashboard dat Parquet-bestand, dezelfde 700+ vacatures uit de Gold-laag.
+`data/raw` en `data/processed` gaan niet mee in git. `data/sample/gold_jobs_sample.parquet` wel. Op Cloud leest het dashboard dat Parquet-bestand, dezelfde 700+ vacatures uit de Gold-laag: [Live Dashboard](https://data-engineer-project---tech-job-pipeline-nze7yci7bypihjtxkt6v.streamlit.app/).
 
 ## Kwaliteitscontrole
 
