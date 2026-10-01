@@ -31,6 +31,8 @@ DELTA_GOLD_DIR = os.path.join(PROJECT_ROOT, "data", "processed", "delta", "gold"
 PARQUET_GOLD_DIR = os.path.join(PROJECT_ROOT, "data", "processed", "gold")
 RAW_DIR = os.path.join(PROJECT_ROOT, "data", "raw")
 SAMPLE_PATH = os.path.join(PROJECT_ROOT, "data", "sample", "jobs_sample.json")
+GOLD_SAMPLE_PATH = os.path.join(PROJECT_ROOT, "data", "sample", "gold_jobs_sample.parquet")
+GOLD_SOURCE_LABEL = "Data Source: Gold Delta Layer (700+ Jobs processed via PySpark)"
 GOLD_TABLES = ("fct_vacancies", "dim_company", "dim_location")
 
 API_URL = "https://remotive.com/api/remote-jobs"
@@ -64,6 +66,7 @@ VACANCY_COLUMNS = (
 )
 
 SOURCE_GOLD = "gold-delta"
+SOURCE_GOLD_SAMPLE = "gold-sample"
 SOURCE_PARQUET = "gold-parquet"
 SOURCE_RAW = "bronze-json"
 SOURCE_LIVE = "remotive-api"
@@ -419,31 +422,59 @@ def _save_raw(payload: dict, raw_dir: str | os.PathLike[str]) -> None:
         return
 
 
+def _read_gold_sample(path: str | os.PathLike[str]) -> pd.DataFrame | None:
+    """Read the single compressed fact sample shipped with the repository."""
+    sample = _as_path(path)
+    if not os.path.isfile(sample):
+        return None
+    quoted = sample.replace("\\", "/").replace("'", "''")
+    connection = duckdb.connect(database=":memory:")
+    try:
+        frame = connection.execute(f"SELECT * FROM read_parquet('{quoted}')").df()
+    finally:
+        connection.close()
+    return _prepare_vacancies(frame)
+
+
 def resolve_vacancies(
     delta_root: str | os.PathLike[str] | None = None,
     parquet_root: str | os.PathLike[str] | None = None,
     raw_dir: str | os.PathLike[str] | None = None,
     sample_path: str | os.PathLike[str] | None = None,
+    gold_sample_path: str | os.PathLike[str] | None = None,
     allow_fetch: bool = True,
 ) -> tuple[pd.DataFrame, str]:
-    """Load vacancies from gold files, bronze JSON, the live API, or the sample.
+    """Load vacancies from Delta, the shipped Parquet sample, or a later fallback.
 
-    Every missing path and every failed read is skipped. A clean Streamlit
-    Cloud disk therefore ends at the bundled sample, or at an empty frame
-    when that file is absent too.
+    Every missing path and every failed read is skipped. Streamlit Cloud has
+    no ``data/processed`` tree, so the compressed fact sample is the next source.
     """
     delta_root = DELTA_GOLD_DIR if delta_root is None else delta_root
     parquet_root = PARQUET_GOLD_DIR if parquet_root is None else parquet_root
     raw_dir = RAW_DIR if raw_dir is None else raw_dir
     sample_path = SAMPLE_PATH if sample_path is None else sample_path
+    gold_sample_path = GOLD_SAMPLE_PATH if gold_sample_path is None else gold_sample_path
 
-    for root, source in ((delta_root, SOURCE_GOLD), (parquet_root, SOURCE_PARQUET)):
-        try:
-            frame = _read_gold_directory(root)
-        except Exception:
-            frame = None
-        if frame is not None and not frame.empty:
-            return frame, source
+    try:
+        frame = _read_gold_directory(delta_root)
+    except Exception:
+        frame = None
+    if frame is not None and not frame.empty:
+        return frame, SOURCE_GOLD
+
+    try:
+        frame = _read_gold_sample(gold_sample_path)
+    except Exception:
+        frame = None
+    if frame is not None and not frame.empty:
+        return frame, SOURCE_GOLD_SAMPLE
+
+    try:
+        frame = _read_gold_directory(parquet_root)
+    except Exception:
+        frame = None
+    if frame is not None and not frame.empty:
+        return frame, SOURCE_PARQUET
 
     try:
         raw_jobs: list[dict] = []
@@ -539,9 +570,8 @@ def _matches(frame: pd.DataFrame, query: str) -> pd.DataFrame:
 def _source_caption(source: str) -> str:
     """Dutch caption for the source that actually supplied the rows."""
     captions = {
-        SOURCE_GOLD: (
-            "Gold Delta-tabellen, gelezen met DuckDB. Bron: Remotive."
-        ),
+        SOURCE_GOLD: GOLD_SOURCE_LABEL,
+        SOURCE_GOLD_SAMPLE: GOLD_SOURCE_LABEL,
         SOURCE_PARQUET: (
             "Gold Parquet-bestanden, gelezen met DuckDB. Bron: Remotive."
         ),
@@ -580,8 +610,11 @@ def main() -> None:
 
     try:
         with st.spinner("Vacatures laden..."):
+            sample_token = ""
+            if os.path.isfile(GOLD_SAMPLE_PATH):
+                sample_token = str(os.stat(GOLD_SAMPLE_PATH).st_mtime_ns)
             vacancies, source = load_vacancies(
-                _directory_token(DELTA_GOLD_DIR) + _directory_token(PARQUET_GOLD_DIR),
+                _directory_token(DELTA_GOLD_DIR) + _directory_token(PARQUET_GOLD_DIR) + sample_token,
                 _directory_token(RAW_DIR),
             )
     except Exception as exc:
@@ -590,7 +623,15 @@ def main() -> None:
         with st.expander("Technische details"):
             st.write(str(exc))
 
-    st.caption(_source_caption(source))
+    if source in {SOURCE_GOLD, SOURCE_GOLD_SAMPLE}:
+        st.markdown(
+            '<p style="display:inline-block;margin:0 0 0.75rem;padding:0.2rem 0.7rem;'
+            'border-radius:999px;background:#E7F2EF;color:#0F6E6B;font-size:0.85rem;">'
+            f"{GOLD_SOURCE_LABEL}</p>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.caption(_source_caption(source))
     if source == SOURCE_SAMPLE:
         st.info(
             "Er staan nog geen Gold-tabellen of bronze-bestanden op deze server. "

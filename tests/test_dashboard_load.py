@@ -141,6 +141,7 @@ def test_missing_lake_uses_raw_json_before_sample(tmp_path: Path) -> None:
         parquet_root=tmp_path / "no-parquet",
         raw_dir=raw_dir,
         sample_path=SAMPLE_PATH,
+        gold_sample_path=tmp_path / "missing-gold.parquet",
         allow_fetch=False,
     )
     assert source == SOURCE_RAW
@@ -197,11 +198,41 @@ def test_raw_directory_combines_every_json_file(tmp_path: Path) -> None:
         parquet_root=tmp_path / "no-parquet",
         raw_dir=raw_dir,
         sample_path=SAMPLE_PATH,
+        gold_sample_path=tmp_path / "missing-gold.parquet",
         allow_fetch=False,
     )
     assert source == SOURCE_RAW
     assert set(frame["vacancy_id"]) == {1, 2}
     assert len(frame) == 2
+
+
+def test_gold_parquet_sample_is_preferred_over_the_json_demo(tmp_path: Path) -> None:
+    """Streamlit Cloud reads the shipped fact sample when Delta is absent."""
+    sample = tmp_path / "gold_jobs_sample.parquet"
+    connection = duckdb.connect()
+    try:
+        connection.execute(
+            "COPY ("
+            "SELECT 7::BIGINT AS vacancy_id, 'Data Engineer' AS title, "
+            "'Northwind' AS company_name, 'Data and Analytics' AS category, "
+            "'Europe' AS location_name, '' AS salary, 'Pipelines' AS description, "
+            "DATE '2026-09-20' AS publication_date, "
+            "TIMESTAMP '2026-09-20 09:00:00' AS publication_timestamp"
+            f") TO '{sample.as_posix()}' (FORMAT PARQUET, COMPRESSION SNAPPY)"
+        )
+    finally:
+        connection.close()
+    frame, source = resolve_vacancies(
+        delta_root=tmp_path / "no-delta",
+        parquet_root=tmp_path / "no-parquet",
+        raw_dir=tmp_path / "no-raw",
+        sample_path=SAMPLE_PATH,
+        gold_sample_path=sample,
+        allow_fetch=False,
+    )
+    assert source == "gold-sample"
+    assert list(frame["vacancy_id"]) == [7]
+    assert frame.iloc[0]["company_name"] == "Northwind"
 
 
 def test_sample_loads_when_lake_and_api_are_unavailable(tmp_path: Path) -> None:
@@ -211,6 +242,7 @@ def test_sample_loads_when_lake_and_api_are_unavailable(tmp_path: Path) -> None:
         parquet_root=tmp_path / "no-parquet",
         raw_dir=tmp_path / "no-raw",
         sample_path=SAMPLE_PATH,
+        gold_sample_path=tmp_path / "missing-gold.parquet",
         allow_fetch=False,
     )
     assert source == SOURCE_SAMPLE

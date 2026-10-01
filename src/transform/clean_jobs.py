@@ -33,6 +33,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RAW_DIR = PROJECT_ROOT / "data" / "raw"
 DEFAULT_PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 DEFAULT_DELTA_ROOT = DEFAULT_PROCESSED_DIR / "delta"
+GOLD_SAMPLE_PATH = PROJECT_ROOT / "data" / "sample" / "gold_jobs_sample.parquet"
 DELTA_EXTENSION = "io.delta.sql.DeltaSparkSessionExtension"
 DELTA_CATALOG = "org.apache.spark.sql.delta.catalog.DeltaCatalog"
 RAW_FILE_PATTERN = "jobs_raw_*.json"
@@ -676,6 +677,56 @@ def _storage_target(root: str, relative_path: str) -> str:
     return f"{root.rstrip('/')}/{relative_path.strip('/')}"
 
 
+def write_gold_sample(
+    fact: DataFrame,
+    company: DataFrame,
+    location: DataFrame,
+    destination: Path = GOLD_SAMPLE_PATH,
+) -> None:
+    """Write ``fct_vacancies`` as one Snappy Parquet file for the dashboard.
+
+    Company and location names are included so Streamlit Cloud can chart the
+    fact grain without the rest of the Delta lake.
+    """
+    serving = (
+        fact.join(company, "company_id", "left")
+        .join(location, "location_id", "left")
+        .select(
+            "vacancy_id",
+            "company_id",
+            "location_id",
+            "publication_date",
+            "publication_timestamp",
+            "title",
+            "company_name",
+            "category",
+            "location_name",
+            "salary",
+            "description",
+        )
+    )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staging = destination.parent / "_gold_sample_staging"
+    if staging.exists():
+        shutil.rmtree(staging)
+    (
+        serving.coalesce(1)
+        .write.mode("overwrite")
+        .option("compression", "snappy")
+        .parquet(staging.as_posix())
+    )
+    parts = [path for path in staging.glob("*.parquet") if path.is_file()]
+    if len(parts) != 1:
+        raise JobTransformError(
+            f"Expected one Parquet part in {staging}, found {len(parts)}"
+        )
+    if destination.exists():
+        destination.unlink()
+    shutil.move(str(parts[0]), str(destination))
+    shutil.rmtree(staging, ignore_errors=True)
+    logger.info("Wrote compressed gold sample to %s", destination)
+
+
 def write_table(frame: DataFrame, destination: str | Path) -> None:
     """Overwrite one Delta table at ``destination``."""
     target = destination.as_posix() if isinstance(destination, Path) else destination
@@ -722,6 +773,11 @@ def run_transformation(
             counts[relative_path] = row_count
             if materialized is not silver:
                 materialized.unpersist()
+        write_gold_sample(
+            gold["fct_vacancies"],
+            gold["dim_company"],
+            gold["dim_location"],
+        )
     finally:
         silver.unpersist()
 
