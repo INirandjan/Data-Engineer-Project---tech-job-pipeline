@@ -1,50 +1,44 @@
-"""Interactive view of cleaned tech vacancies, without a JVM.
+"""Standalone Streamlit dashboard. No imports from this repository.
 
 Run from the repository root:
 
     streamlit run src/dashboard/app.py
 
-Streamlit Cloud can use the same entry point. The app never imports PySpark.
-It reads local Delta or Parquet with DuckDB when those files exist. Otherwise
-it transforms the newest bronze JSON, fetches the Remotive API, or loads
-``data/sample/jobs_sample.json``.
+Streamlit Cloud uses the same file. The module loads with only installed
+packages, so a missing ``src`` package on ``sys.path`` cannot raise
+``ModuleNotFoundError``.
 """
 
 from __future__ import annotations
 
 import json
-import logging
+import os
 import re
-from pathlib import Path
+import time
 
 import duckdb
 import pandas as pd
-import plotly.express as px
+import requests
 import streamlit as st
 
-from src.extract.fetch_jobs import (
-    DEFAULT_API_URL,
-    DEFAULT_SEARCH_TERM,
-    JobExtractionError,
-    fetch_jobs,
-    load_settings,
-)
+_HERE = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(_HERE, os.pardir, os.pardir))
+if not os.path.isdir(os.path.join(PROJECT_ROOT, "data")):
+    PROJECT_ROOT = os.getcwd()
 
-logger = logging.getLogger(__name__)
-
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DELTA_GOLD_DIR = PROJECT_ROOT / "data" / "processed" / "delta" / "gold"
-PARQUET_GOLD_DIR = PROJECT_ROOT / "data" / "processed" / "gold"
-RAW_DIR = PROJECT_ROOT / "data" / "raw"
-SAMPLE_PATH = PROJECT_ROOT / "data" / "sample" / "jobs_sample.json"
-RAW_FILE_PATTERN = "jobs_raw_*.json"
+DELTA_GOLD_DIR = os.path.join(PROJECT_ROOT, "data", "processed", "delta", "gold")
+PARQUET_GOLD_DIR = os.path.join(PROJECT_ROOT, "data", "processed", "gold")
+RAW_DIR = os.path.join(PROJECT_ROOT, "data", "raw")
+SAMPLE_PATH = os.path.join(PROJECT_ROOT, "data", "sample", "jobs_sample.json")
 GOLD_TABLES = ("fct_vacancies", "dim_company", "dim_location")
 
-TITLE_KEYWORDS: tuple[str, ...] = ("data", "engineer", "developer", "python")
+API_URL = "https://remotive.com/api/remote-jobs"
+SEARCH_TERM = "Data Engineer"
+TITLE_KEYWORDS = ("data", "engineer", "developer", "python")
 UNKNOWN_COMPANY = "Unknown"
 UNSPECIFIED_LOCATION = "Unspecified"
 HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
-HTML_ENTITIES: tuple[tuple[str, str], ...] = (
+HTML_ENTITIES = (
     ("&nbsp;", " "),
     ("&lt;", "<"),
     ("&gt;", ">"),
@@ -52,10 +46,6 @@ HTML_ENTITIES: tuple[tuple[str, str], ...] = (
     ("&#39;", "'"),
     ("&amp;", "&"),
 )
-
-PAGE_TITLE = "Tech Job Market"
-ACCENT = "#0F6E6B"
-PALETTE = ["#0F6E6B", "#1F8A84", "#3D9B8F", "#7FB9A8", "#C4DDD4", "#E7F2EF"]
 VACANCY_COLUMNS = (
     "vacancy_id",
     "publication_date",
@@ -73,11 +63,17 @@ SOURCE_PARQUET = "gold-parquet"
 SOURCE_RAW = "bronze-json"
 SOURCE_LIVE = "remotive-api"
 SOURCE_SAMPLE = "sample"
+SOURCE_EMPTY = "empty"
 
 
 def _empty_vacancies() -> pd.DataFrame:
     """Return a vacancy frame with the columns the charts expect."""
     return pd.DataFrame(columns=list(VACANCY_COLUMNS))
+
+
+def _as_path(path: str | os.PathLike[str]) -> str:
+    """Return a filesystem path string."""
+    return os.fspath(path)
 
 
 def _clean_text(value: object) -> str | None:
@@ -107,14 +103,11 @@ def _title_is_relevant(title: str | None) -> bool:
 
 
 def vacancies_from_jobs(jobs: list[dict]) -> pd.DataFrame:
-    """Clean a Remotive ``jobs`` array into the dashboard vacancy grain.
-
-    This is the lightweight stand-in for the Spark silver/gold job. It keeps
-    the same title filter, HTML cleanup, and unknown-company rules, and
-    returns one flat row per vacancy so the app does not need the JVM.
-    """
+    """Clean a Remotive ``jobs`` array into the dashboard vacancy grain."""
     rows: list[dict[str, object]] = []
     for job in jobs:
+        if not isinstance(job, dict):
+            continue
         title = _clean_text(job.get("title"))
         if not _title_is_relevant(title):
             continue
@@ -124,7 +117,9 @@ def vacancies_from_jobs(jobs: list[dict]) -> pd.DataFrame:
             continue
         published = pd.to_datetime(job.get("publication_date"), errors="coerce")
         company = _clean_text(job.get("company_name")) or UNKNOWN_COMPANY
-        location = _clean_text(job.get("candidate_required_location")) or UNSPECIFIED_LOCATION
+        location = (
+            _clean_text(job.get("candidate_required_location")) or UNSPECIFIED_LOCATION
+        )
         rows.append(
             {
                 "vacancy_id": vacancy_id,
@@ -151,40 +146,63 @@ def vacancies_from_jobs(jobs: list[dict]) -> pd.DataFrame:
     )
 
 
-def _read_job_list(path: Path) -> list[dict]:
+def _read_job_list(path: str | os.PathLike[str]) -> list[dict]:
     """Read the ``jobs`` array from a bronze-shaped JSON document."""
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    with open(_as_path(path), encoding="utf-8") as handle:
+        payload = json.load(handle)
     jobs = payload.get("jobs") if isinstance(payload, dict) else payload
     if not isinstance(jobs, list):
-        raise ValueError(f"{path.name} does not contain a jobs array")
+        raise ValueError(f"{os.path.basename(_as_path(path))} does not contain a jobs array")
     return [job for job in jobs if isinstance(job, dict)]
 
 
-def _latest_raw_file(raw_dir: Path) -> Path | None:
+def _latest_raw_file(raw_dir: str | os.PathLike[str]) -> str | None:
     """Return the newest ``jobs_raw_<timestamp>.json`` file, if any."""
-    if not raw_dir.is_dir():
+    directory = _as_path(raw_dir)
+    if not os.path.isdir(directory):
         return None
-    candidates = sorted(path for path in raw_dir.glob(RAW_FILE_PATTERN) if path.is_file())
-    return candidates[-1] if candidates else None
+    names = sorted(
+        name
+        for name in os.listdir(directory)
+        if name.startswith("jobs_raw_")
+        and name.endswith(".json")
+        and os.path.isfile(os.path.join(directory, name))
+    )
+    if not names:
+        return None
+    return os.path.join(directory, names[-1])
 
 
-def active_parquet_files(table_dir: Path) -> list[str]:
+def active_parquet_files(table_dir: str | os.PathLike[str]) -> list[str]:
     """Return the Parquet files that the current Delta snapshot still contains.
 
     A plain Parquet directory has no transaction log, so every ``*.parquet``
     file is current. A Delta table is replayed from ``_delta_log`` so removed
     files from older overwrites are not counted twice.
     """
-    if not table_dir.is_dir():
+    directory = _as_path(table_dir)
+    if not os.path.isdir(directory):
         return []
-    log_dir = table_dir / "_delta_log"
-    commits = sorted(log_dir.glob("*.json")) if log_dir.is_dir() else []
+    log_dir = os.path.join(directory, "_delta_log")
+    commits = []
+    if os.path.isdir(log_dir):
+        commits = sorted(
+            os.path.join(log_dir, name)
+            for name in os.listdir(log_dir)
+            if name.endswith(".json") and os.path.isfile(os.path.join(log_dir, name))
+        )
     if not commits:
-        return sorted(path.as_posix() for path in table_dir.glob("*.parquet") if path.is_file())
+        return sorted(
+            os.path.join(directory, name).replace("\\", "/")
+            for name in os.listdir(directory)
+            if name.endswith(".parquet") and os.path.isfile(os.path.join(directory, name))
+        )
 
     active: dict[str, None] = {}
     for commit in commits:
-        for line in commit.read_text(encoding="utf-8").splitlines():
+        with open(commit, encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+        for line in lines:
             if not line.strip():
                 continue
             action = json.loads(line)
@@ -194,9 +212,9 @@ def active_parquet_files(table_dir: Path) -> list[str]:
                 active.pop(action["remove"]["path"], None)
     files: list[str] = []
     for relative in active:
-        path = table_dir / relative
-        if path.is_file():
-            files.append(path.as_posix())
+        path = os.path.join(directory, relative)
+        if os.path.isfile(path):
+            files.append(path.replace("\\", "/"))
     return files
 
 
@@ -212,11 +230,35 @@ def _read_parquet(paths: list[str]) -> pd.DataFrame:
         connection.close()
 
 
-def _read_gold_directory(gold_dir: Path) -> pd.DataFrame | None:
+def _prepare_vacancies(frame: pd.DataFrame) -> pd.DataFrame:
+    """Normalize dtypes and sort the newest publication first."""
+    if frame.empty:
+        return _empty_vacancies()
+    prepared = frame.copy()
+    for column in VACANCY_COLUMNS:
+        if column not in prepared.columns:
+            prepared[column] = pd.NA
+    prepared = prepared.loc[:, list(VACANCY_COLUMNS)]
+    prepared["publication_timestamp"] = pd.to_datetime(
+        prepared["publication_timestamp"], errors="coerce"
+    )
+    prepared["publication_date"] = pd.to_datetime(
+        prepared["publication_date"], errors="coerce"
+    ).dt.date
+    for column in ("title", "company_name", "category", "location_name", "salary"):
+        prepared[column] = prepared[column].fillna("").astype(str).str.strip()
+    prepared["description"] = prepared["description"].fillna("").astype(str)
+    return prepared.sort_values(
+        "publication_timestamp", ascending=False, na_position="last"
+    ).reset_index(drop=True)
+
+
+def _read_gold_directory(gold_dir: str | os.PathLike[str]) -> pd.DataFrame | None:
     """Join fact, company, and location when all three tables have files."""
+    root = _as_path(gold_dir)
     tables: dict[str, pd.DataFrame] = {}
     for name in GOLD_TABLES:
-        files = active_parquet_files(gold_dir / name)
+        files = active_parquet_files(os.path.join(root, name))
         if not files:
             return None
         tables[name] = _read_parquet(files)
@@ -247,36 +289,54 @@ def _read_gold_directory(gold_dir: Path) -> pd.DataFrame | None:
     return _prepare_vacancies(frame)
 
 
-def _prepare_vacancies(frame: pd.DataFrame) -> pd.DataFrame:
-    """Normalize dtypes and sort the newest publication first."""
-    if frame.empty:
-        return _empty_vacancies()
-    prepared = frame.copy()
-    prepared["publication_timestamp"] = pd.to_datetime(
-        prepared["publication_timestamp"], errors="coerce"
+def _fetch_remotive(raw_dir: str | os.PathLike[str]) -> list[dict]:
+    """GET the public Remotive API and optionally land the body in ``data/raw``."""
+    response = requests.get(
+        os.environ.get("REMOTIVE_API_URL", API_URL),
+        params={"search": os.environ.get("JOB_SEARCH_TERM", SEARCH_TERM)},
+        timeout=20,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "tech-job-pipeline/0.1 (educational data-engineering project)",
+        },
     )
-    prepared["publication_date"] = pd.to_datetime(
-        prepared["publication_date"], errors="coerce"
-    ).dt.date
-    for column in ("title", "company_name", "category", "location_name", "salary"):
-        prepared[column] = prepared[column].fillna("").astype(str).str.strip()
-    prepared["description"] = prepared["description"].fillna("").astype(str)
-    return prepared.sort_values(
-        "publication_timestamp", ascending=False, na_position="last"
-    ).reset_index(drop=True)
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError("Remotive response was not a JSON object")
+    jobs = payload.get("jobs")
+    if not isinstance(jobs, list):
+        raise ValueError("Remotive response does not contain a jobs array")
+    _save_raw(payload, raw_dir)
+    return [job for job in jobs if isinstance(job, dict)]
+
+
+def _save_raw(payload: dict, raw_dir: str | os.PathLike[str]) -> None:
+    """Write a bronze file when the process can create ``data/raw``."""
+    directory = _as_path(raw_dir)
+    try:
+        os.makedirs(directory, exist_ok=True)
+        name = time.strftime("jobs_raw_%Y%m%d_%H%M%S.json", time.gmtime())
+        path = os.path.join(directory, name)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+    except OSError:
+        return
 
 
 def resolve_vacancies(
-    delta_root: Path | None = None,
-    parquet_root: Path | None = None,
-    raw_dir: Path | None = None,
-    sample_path: Path | None = None,
+    delta_root: str | os.PathLike[str] | None = None,
+    parquet_root: str | os.PathLike[str] | None = None,
+    raw_dir: str | os.PathLike[str] | None = None,
+    sample_path: str | os.PathLike[str] | None = None,
     allow_fetch: bool = True,
 ) -> tuple[pd.DataFrame, str]:
     """Load vacancies from gold files, bronze JSON, the live API, or the sample.
 
-    The first source that yields rows wins. ``allow_fetch`` is off in tests
-    so a missing lake does not call Remotive.
+    Every missing path and every failed read is skipped. A clean Streamlit
+    Cloud disk therefore ends at the bundled sample, or at an empty frame
+    when that file is absent too.
     """
     delta_root = DELTA_GOLD_DIR if delta_root is None else delta_root
     parquet_root = PARQUET_GOLD_DIR if parquet_root is None else parquet_root
@@ -286,47 +346,52 @@ def resolve_vacancies(
     for root, source in ((delta_root, SOURCE_GOLD), (parquet_root, SOURCE_PARQUET)):
         try:
             frame = _read_gold_directory(root)
-        except (OSError, ValueError, duckdb.Error, json.JSONDecodeError) as exc:
-            logger.warning("Could not read gold tables in %s: %s", root, exc)
+        except Exception:
             frame = None
         if frame is not None and not frame.empty:
             return frame, source
 
-    raw_file = _latest_raw_file(raw_dir)
-    if raw_file is not None:
-        frame = vacancies_from_jobs(_read_job_list(raw_file))
-        if not frame.empty:
-            return frame, SOURCE_RAW
+    try:
+        raw_file = _latest_raw_file(raw_dir)
+        if raw_file is not None:
+            frame = vacancies_from_jobs(_read_job_list(raw_file))
+            if not frame.empty:
+                return frame, SOURCE_RAW
+    except Exception:
+        pass
 
     if allow_fetch:
         try:
-            settings = load_settings()
-            payload = fetch_jobs(
-                settings.get("search_term") or DEFAULT_SEARCH_TERM,
-                api_url=settings.get("api_url") or DEFAULT_API_URL,
-            )
-            frame = vacancies_from_jobs(payload.get("jobs") or [])
+            frame = vacancies_from_jobs(_fetch_remotive(raw_dir))
             if not frame.empty:
                 return frame, SOURCE_LIVE
-        except (JobExtractionError, OSError, ValueError) as exc:
-            logger.warning("Live Remotive fetch failed, using the sample: %s", exc)
+        except Exception:
+            pass
 
-    if not sample_path.is_file():
-        raise FileNotFoundError(
-            f"No gold data, bronze JSON, or sample file at {sample_path}"
-        )
-    frame = vacancies_from_jobs(_read_job_list(sample_path))
-    return frame, SOURCE_SAMPLE
+    sample = _as_path(sample_path)
+    if os.path.isfile(sample):
+        try:
+            frame = vacancies_from_jobs(_read_job_list(sample))
+            if not frame.empty:
+                return frame, SOURCE_SAMPLE
+        except Exception:
+            pass
+    return _empty_vacancies(), SOURCE_EMPTY
 
 
-def _directory_token(root: Path) -> str:
+def _directory_token(root: str | os.PathLike[str]) -> str:
     """Change when gold files are rewritten, so the Streamlit cache drops."""
-    if not root.is_dir():
+    directory = _as_path(root)
+    if not os.path.isdir(directory):
         return ""
     stamps: list[int] = []
-    for path in root.rglob("*"):
-        if path.is_file() and path.suffix in {".parquet", ".json"}:
-            stamps.append(path.stat().st_mtime_ns)
+    for dirpath, _dirnames, filenames in os.walk(directory):
+        for name in filenames:
+            if name.endswith(".parquet") or name.endswith(".json"):
+                try:
+                    stamps.append(os.stat(os.path.join(dirpath, name)).st_mtime_ns)
+                except OSError:
+                    continue
     if not stamps:
         return ""
     return f"{len(stamps)}:{max(stamps)}"
@@ -334,108 +399,80 @@ def _directory_token(root: Path) -> str:
 
 @st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
 def load_vacancies(gold_token: str, raw_token: str) -> tuple[pd.DataFrame, str]:
-    """Cache the resolved vacancy frame for one Streamlit session.
-
-    ``gold_token`` and ``raw_token`` are cache keys. A new Delta commit or
-    bronze file misses the cache immediately. A live API response stays
-    cached for six hours, within Remotive's request guidance.
-    """
+    """Cache the resolved vacancy frame for one Streamlit session."""
     del gold_token, raw_token
     return resolve_vacancies()
 
 
-def _top_counts(frame: pd.DataFrame, column: str, limit: int = 5) -> pd.DataFrame:
-    """Return the most frequent non-blank values in ``column``."""
-    values = frame[column].replace("", pd.NA).dropna()
-    counts = values.value_counts().head(limit).rename_axis(column).reset_index(name="aantal")
-    return counts
+def _count_by(frame: pd.DataFrame, column: str, limit: int) -> pd.DataFrame:
+    """Aggregate one column with DuckDB. Failures become an empty chart frame."""
+    if column not in {"category", "location_name"} or frame.empty:
+        return pd.DataFrame(columns=["label", "aantal"])
+    try:
+        duckdb.register("vacancies", frame)
+        return duckdb.query(
+            f"""
+            SELECT {column} AS label, COUNT(*)::BIGINT AS aantal
+            FROM vacancies
+            WHERE {column} IS NOT NULL AND TRIM(CAST({column} AS VARCHAR)) <> ''
+            GROUP BY 1
+            ORDER BY aantal DESC
+            LIMIT {int(limit)}
+            """
+        ).df()
+    except Exception:
+        return pd.DataFrame(columns=["label", "aantal"])
 
 
 def _matches(frame: pd.DataFrame, query: str) -> pd.DataFrame:
     """Keep rows whose visible text contains ``query``."""
-    if not query.strip():
+    if frame.empty or not query.strip():
         return frame
     haystack = (
-        frame["title"].str.cat(frame["company_name"], sep=" ")
-        .str.cat(frame["category"], sep=" ")
-        .str.cat(frame["location_name"], sep=" ")
-        .str.cat(frame["description"], sep=" ")
+        frame["title"].fillna("").str.cat(frame["company_name"].fillna(""), sep=" ")
+        .str.cat(frame["category"].fillna(""), sep=" ")
+        .str.cat(frame["location_name"].fillna(""), sep=" ")
+        .str.cat(frame["description"].fillna(""), sep=" ")
         .str.casefold()
     )
     return frame.loc[haystack.str.contains(query.casefold(), regex=False)].copy()
-
-
-def _bar_chart(counts: pd.DataFrame, label: str, title: str):
-    """Horizontal bar chart, largest value at the top."""
-    figure = px.bar(
-        counts.sort_values("aantal", ascending=True),
-        x="aantal",
-        y=label,
-        orientation="h",
-        text="aantal",
-        color_discrete_sequence=[ACCENT],
-    )
-    figure.update_layout(
-        title=title,
-        template="plotly_white",
-        margin={"l": 8, "r": 8, "t": 48, "b": 8},
-        height=380,
-        xaxis_title="Aantal vacatures",
-        yaxis_title="",
-    )
-    figure.update_traces(textposition="outside", cliponaxis=False)
-    return figure
-
-
-def _location_chart(counts: pd.DataFrame):
-    """Donut chart of the published location requirements."""
-    figure = px.pie(
-        counts,
-        names="location_name",
-        values="aantal",
-        hole=0.46,
-        color_discrete_sequence=PALETTE,
-    )
-    figure.update_layout(
-        title="Verdeling van locaties",
-        template="plotly_white",
-        margin={"l": 8, "r": 8, "t": 48, "b": 8},
-        height=380,
-        legend_title_text="",
-    )
-    figure.update_traces(textposition="inside", textinfo="percent")
-    return figure
 
 
 def _source_caption(source: str) -> str:
     """Dutch caption for the source that actually supplied the rows."""
     captions = {
         SOURCE_GOLD: (
-            "Gold Delta-tabellen, gelezen met DuckDB. "
-            "Bron: Remotive, opgeschoond in de silver-laag."
+            "Gold Delta-tabellen, gelezen met DuckDB. Bron: Remotive."
         ),
         SOURCE_PARQUET: (
-            "Gold Parquet-bestanden, gelezen met DuckDB. "
-            "Bron: Remotive, opgeschoond in de silver-laag."
+            "Gold Parquet-bestanden, gelezen met DuckDB. Bron: Remotive."
         ),
-        SOURCE_RAW: (
-            "Nieuwste bronze JSON, in Python opgeschoond. "
-            "Bron: Remotive."
-        ),
-        SOURCE_LIVE: (
-            "Live opgehaald bij de Remotive API en in Python opgeschoond."
-        ),
+        SOURCE_RAW: "Nieuwste bronze JSON, in Python opgeschoond. Bron: Remotive.",
+        SOURCE_LIVE: "Live opgehaald bij de Remotive API en in Python opgeschoond.",
         SOURCE_SAMPLE: (
             "Demo-set uit data/sample, omdat er nog geen gold- of bronze-data is."
         ),
+        SOURCE_EMPTY: "Geen vacatures beschikbaar.",
     }
     return captions.get(source, "Bron: Remotive.")
+
+
+def _bar(counts: pd.DataFrame, title: str) -> None:
+    """Render one aggregated bar chart, or a short note when it is empty."""
+    st.subheader(title)
+    if counts.empty:
+        st.info("Geen waarden om te tonen.")
+        return
+    try:
+        st.bar_chart(counts.set_index("label")["aantal"])
+    except Exception:
+        st.dataframe(counts, use_container_width=True, hide_index=True)
 
 
 def main() -> None:
     """Render the vacancy dashboard."""
     st.set_page_config(
-        page_title=PAGE_TITLE,
+        page_title="Tech Job Market",
         page_icon=":bar_chart:",
         layout="wide",
     )
@@ -448,10 +485,10 @@ def main() -> None:
                 _directory_token(RAW_DIR),
             )
     except Exception as exc:
+        vacancies, source = _empty_vacancies(), SOURCE_EMPTY
         st.error("De vacatures konden niet worden geladen.")
         with st.expander("Technische details"):
             st.write(str(exc))
-        st.stop()
 
     st.caption(_source_caption(source))
     if source == SOURCE_SAMPLE:
@@ -459,37 +496,22 @@ def main() -> None:
             "Er staan nog geen Gold-tabellen of bronze-bestanden op deze server. "
             "Het dashboard toont de gebundelde demo."
         )
-
     if vacancies.empty:
         st.info("Er zijn nog geen vacatures om te tonen.")
-        st.stop()
+        return
 
     companies = vacancies["company_name"].replace("", pd.NA).nunique(dropna=True)
     locations = vacancies["location_name"].replace("", pd.NA).nunique(dropna=True)
     metric_vacancies, metric_companies, metric_locations = st.columns(3)
     metric_vacancies.metric("Totaal aantal verwerkte vacatures", f"{len(vacancies)}")
-    metric_companies.metric("Bedrijven", f"{companies}")
+    metric_companies.metric("Unieke bedrijven", f"{companies}")
     metric_locations.metric("Locaties", f"{locations}")
 
-    categories = _top_counts(vacancies, "category", limit=5)
-    location_counts = _top_counts(vacancies, "location_name", limit=8)
     chart_roles, chart_locations = st.columns(2)
     with chart_roles:
-        if categories.empty:
-            st.info("Geen categorieën om te tonen.")
-        else:
-            st.plotly_chart(
-                _bar_chart(categories, "category", "Top 5 meest gevraagde categorieën"),
-                use_container_width=True,
-            )
+        _bar(_count_by(vacancies, "category", limit=5), "Top 5 meest gevraagde categorieën")
     with chart_locations:
-        if location_counts.empty:
-            st.info("Geen locaties om te tonen.")
-        else:
-            st.plotly_chart(
-                _location_chart(location_counts),
-                use_container_width=True,
-            )
+        _bar(_count_by(vacancies, "location_name", limit=8), "Verdeling van locaties")
 
     st.subheader("Meest recente vacatures")
     query = st.text_input(

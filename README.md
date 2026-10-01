@@ -103,13 +103,13 @@ streamlit run src/dashboard/app.py
 
 `clean_jobs.py` leest het nieuwste bronze-bestand en overschrijft de Delta-tabellen. Voor Azure vul je in `.env` `STORAGE_TYPE=azure`, `AZURE_STORAGE_ACCOUNT` en `AZURE_STORAGE_CONTAINER`. `AZURE_STORAGE_ACCOUNT_KEY` zet shared-key auth; op Databricks kan een managed identity die sleutel vervangen.
 
-Het dashboard heeft die JDK niet nodig. Het leest Gold met DuckDB. Ontbreken de Gold-bestanden, dan schoont het de nieuwste bronze JSON in Python op. Ontbreekt ook die JSON, dan roept het `fetch_jobs` aan. Mislukt de API, dan laadt `data/sample/jobs_sample.json`.
+Het dashboard heeft die JDK niet nodig en importeert geen modules uit `src`. Het leest Gold met DuckDB. Ontbreken de Gold-bestanden, dan schoont het de nieuwste bronze JSON in Python op. Ontbreekt ook die JSON, dan doet `app.py` zelf een `requests.get` naar de Remotive API. Mislukt die call, dan laadt `data/sample/jobs_sample.json`.
 
 ## Streamlit Cloud
 
 Zet het main file op `src/dashboard/app.py`. Python komt uit `runtime.txt` (3.12). Dependencies komen uit `requirements.txt`. `packages.txt` installeert `libgomp1`, de OpenMP-runtime waar DuckDB op Linux aan linkt. PySpark staat in `requirements.txt` voor de lokale transformatie en CI, maar `app.py` importeert het niet.
 
-`data/raw` en `data/processed` gaan niet mee in git. Op Cloud valt het dashboard daarom terug op een live Remotive-call en daarna op de gebundelde demo.
+`data/raw` en `data/processed` gaan niet mee in git. Op Cloud haalt `app.py` zelf vacatures op bij Remotive en valt daarna terug op de gebundelde demo. Een mislukte API-call of een ontbrekende datamap stopt de app niet.
 
 ## Kwaliteitscontrole
 

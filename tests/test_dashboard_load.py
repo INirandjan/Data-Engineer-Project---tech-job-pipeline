@@ -20,10 +20,12 @@ from src.dashboard.app import (
 
 
 def test_dashboard_source_does_not_import_pyspark() -> None:
-    """Streamlit Cloud must be able to import the app without a JDK."""
+    """Streamlit Cloud must import the app without the repo package or a JDK."""
     source = Path("src/dashboard/app.py").read_text(encoding="utf-8")
     assert "pyspark" not in source
     assert "clean_jobs" not in source
+    assert "from src" not in source
+    assert "import src" not in source
 
 
 def test_lightweight_transform_matches_silver_rules() -> None:
