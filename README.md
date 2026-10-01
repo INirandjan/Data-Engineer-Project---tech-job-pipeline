@@ -48,7 +48,7 @@ flowchart LR
 | Bronze | Ruwe API-response, zonder transformatie | `data/raw/jobs_raw_<UTC>.json` |
 | Silver | Relevante kolommen, HTML eruit, titel-filter, timestamps | `data/processed/delta/silver/jobs` |
 | Gold | Sterschema met surrogaatsleutels | `data/processed/delta/gold/` |
-| Serve | Totalen, categorieën, locaties en een zoekbare tabel | `streamlit run src/dashboard/app.py` |
+| Serve | Totalen, categorieën, locaties en een zoekbare tabel. DuckDB leest Gold; zonder die bestanden schoont Python bronze JSON, de live API of `data/sample` op | `streamlit run src/dashboard/app.py` |
 
 ## Medallion-patroon
 
@@ -75,9 +75,12 @@ Ontbrekend bedrijf of ontbrekende locatie wordt `Unknown` of `Unspecified`, zoda
 ```text
 src/extract/fetch_jobs.py       bronze-extractie
 src/transform/clean_jobs.py     silver en gold
-src/dashboard/app.py            Streamlit-dashboard
+src/dashboard/app.py            Streamlit-dashboard, zonder PySpark
 data/raw/                       bronze JSON
 data/processed/delta/           Delta-tabellen
+data/sample/jobs_sample.json    demo voor Streamlit Cloud
+packages.txt                    apt-pakket voor Streamlit Cloud
+runtime.txt                     Python 3.12 op Streamlit Cloud
 tests/                          pytest
 .github/workflows/ci.yml        CI op main en master
 ```
@@ -99,6 +102,14 @@ streamlit run src/dashboard/app.py
 `fetch_jobs.py` vraagt de publieke Remotive-API zonder API-sleutel en schrijft `data/raw/jobs_raw_<YYYYMMDD_HHMMSS>.json`. De standaardzoekterm is `Data Engineer`. Een andere term gaat via `--search Python` of `JOB_SEARCH_TERM` in `.env`.
 
 `clean_jobs.py` leest het nieuwste bronze-bestand en overschrijft de Delta-tabellen. Voor Azure vul je in `.env` `STORAGE_TYPE=azure`, `AZURE_STORAGE_ACCOUNT` en `AZURE_STORAGE_CONTAINER`. `AZURE_STORAGE_ACCOUNT_KEY` zet shared-key auth; op Databricks kan een managed identity die sleutel vervangen.
+
+Het dashboard heeft die JDK niet nodig. Het leest Gold met DuckDB. Ontbreken de Gold-bestanden, dan schoont het de nieuwste bronze JSON in Python op. Ontbreekt ook die JSON, dan roept het `fetch_jobs` aan. Mislukt de API, dan laadt `data/sample/jobs_sample.json`.
+
+## Streamlit Cloud
+
+Zet het main file op `src/dashboard/app.py`. Python komt uit `runtime.txt` (3.12). Dependencies komen uit `requirements.txt`. `packages.txt` installeert `libgomp1`, de OpenMP-runtime waar DuckDB op Linux aan linkt. PySpark staat in `requirements.txt` voor de lokale transformatie en CI, maar `app.py` importeert het niet.
+
+`data/raw` en `data/processed` gaan niet mee in git. Op Cloud valt het dashboard daarom terug op een live Remotive-call en daarna op de gebundelde demo.
 
 ## Kwaliteitscontrole
 

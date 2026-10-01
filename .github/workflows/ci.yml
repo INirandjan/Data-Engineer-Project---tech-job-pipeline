@@ -39,4 +39,4 @@ jobs:
         run: |
           set -o pipefail
           python -m pytest -q --tb=short | tee pytest-output.txt
-          grep -q "21 passed" pytest-output.txt
+          grep -q "26 passed" pytest-output.txt

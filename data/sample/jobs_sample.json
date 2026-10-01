@@ -1,0 +1,104 @@
+{
+  "jobs": [
+    {
+      "id": 1001,
+      "title": "Data Engineer",
+      "company_name": "Northwind Analytics",
+      "category": "Data and Analytics",
+      "publication_date": "2026-09-20T09:00:00",
+      "candidate_required_location": "Europe",
+      "salary": "€70k - €90k",
+      "description": "<p>Build <b>pipelines</b> &amp; warehouse models for product analytics.</p>"
+    },
+    {
+      "id": 1001,
+      "title": "Data Engineer",
+      "company_name": "Northwind Analytics",
+      "category": "Data and Analytics",
+      "publication_date": "2026-09-01T09:00:00",
+      "candidate_required_location": "Europe",
+      "salary": "stale",
+      "description": "<p>Older duplicate that the loader must drop.</p>"
+    },
+    {
+      "id": 1002,
+      "title": "Senior Python Developer",
+      "company_name": "Harbor Systems",
+      "category": "Software Development",
+      "publication_date": "2026-09-18T11:30:00",
+      "candidate_required_location": "Worldwide",
+      "salary": "$120k - $150k",
+      "description": "Design Python services and review data contracts with the platform team."
+    },
+    {
+      "id": 1003,
+      "title": "Frontend Developer",
+      "company_name": "Lumen Studio",
+      "category": "Design",
+      "publication_date": "2026-09-16T08:15:00",
+      "candidate_required_location": "USA, Canada",
+      "salary": "$90k - $110k",
+      "description": "Build the hiring dashboard and keep the interface accessible."
+    },
+    {
+      "id": 1004,
+      "title": "Machine Learning Engineer",
+      "company_name": "Bright Signal",
+      "category": "Artificial Intelligence",
+      "publication_date": "2026-09-14T14:00:00",
+      "candidate_required_location": "Remote",
+      "salary": "$140k - $170k",
+      "description": "Ship ranking models and monitor feature pipelines in production."
+    },
+    {
+      "id": 1005,
+      "title": "Analytics Engineer",
+      "company_name": "Northwind Analytics",
+      "category": "Data and Analytics",
+      "publication_date": "2026-09-12T10:45:00",
+      "candidate_required_location": "Netherlands",
+      "salary": "€65k - €80k",
+      "description": "Model the vacancy mart and document metric definitions."
+    },
+    {
+      "id": 1006,
+      "title": "DevOps Engineer",
+      "company_name": "Cloudline",
+      "category": "Information Technology",
+      "publication_date": "2026-09-09T16:20:00",
+      "candidate_required_location": "Europe, APAC",
+      "salary": "",
+      "description": "Run the deployment pipeline and keep the data platform available."
+    },
+    {
+      "id": 1007,
+      "title": "Platform Engineer",
+      "company_name": "Relay Works",
+      "category": "Software Development",
+      "publication_date": "2026-09-07T13:05:00",
+      "candidate_required_location": "Worldwide",
+      "salary": "$130k - $160k",
+      "description": "Own the internal developer platform and its Python tooling."
+    },
+    {
+      "id": 1008,
+      "title": "Content Reviewer",
+      "company_name": "Skip Me",
+      "category": "All others",
+      "publication_date": "2026-09-21T12:00:00",
+      "candidate_required_location": "USA",
+      "salary": "",
+      "description": "This title is outside the keyword filter and must not appear."
+    },
+    {
+      "id": 1009,
+      "title": "Python Developer",
+      "company_name": " ",
+      "category": "Software Development",
+      "publication_date": "2026-09-05T09:40:00",
+      "candidate_required_location": "",
+      "salary": "",
+      "description": "Blank company and location become Unknown and Unspecified."
+    }
+  ]
+}
