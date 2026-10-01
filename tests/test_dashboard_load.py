@@ -148,6 +148,62 @@ def test_missing_lake_uses_raw_json_before_sample(tmp_path: Path) -> None:
     assert frame.iloc[0]["company_name"] == "Local Bronze"
 
 
+def test_raw_directory_combines_every_json_file(tmp_path: Path) -> None:
+    """Bronze fallback reads the whole landing zone, not only the newest file."""
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    older = {
+        "jobs": [
+            {
+                "id": 1,
+                "title": "Data Engineer",
+                "company_name": "Older Co",
+                "category": "Data",
+                "publication_date": "2026-09-01T00:00:00",
+                "candidate_required_location": "Europe",
+                "salary": "",
+                "description": "First file",
+            }
+        ]
+    }
+    newer = {
+        "jobs": [
+            {
+                "id": 1,
+                "title": "Data Engineer",
+                "company_name": "Older Co",
+                "category": "Data",
+                "publication_date": "2026-09-19T00:00:00",
+                "candidate_required_location": "Europe",
+                "salary": "",
+                "description": "Duplicate id",
+            },
+            {
+                "id": 2,
+                "title": "Backend Developer",
+                "company_name": "Newer Co",
+                "category": "Software Development",
+                "publication_date": "2026-09-18T00:00:00",
+                "candidate_required_location": "Worldwide",
+                "salary": "",
+                "description": "Second file",
+            },
+        ]
+    }
+    (raw_dir / "jobs_raw_20260101_000000.json").write_text(json.dumps(older), encoding="utf-8")
+    (raw_dir / "jobs_raw_20260102_000000.json").write_text(json.dumps(newer), encoding="utf-8")
+    frame, source = resolve_vacancies(
+        delta_root=tmp_path / "no-delta",
+        parquet_root=tmp_path / "no-parquet",
+        raw_dir=raw_dir,
+        sample_path=SAMPLE_PATH,
+        allow_fetch=False,
+    )
+    assert source == SOURCE_RAW
+    assert set(frame["vacancy_id"]) == {1, 2}
+    assert len(frame) == 2
+
+
 def test_sample_loads_when_lake_and_api_are_unavailable(tmp_path: Path) -> None:
     """Streamlit Cloud has no data lake; the bundled demo must still render."""
     frame, source = resolve_vacancies(

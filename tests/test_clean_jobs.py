@@ -185,6 +185,42 @@ def test_clean_raw_data_keeps_the_latest_duplicate(spark: SparkSession) -> None:
     assert rows[0].description == "Later posting"
 
 
+def test_clean_raw_data_drops_same_title_at_another_company_id(
+    spark: SparkSession,
+) -> None:
+    jobs = _bronze(
+        spark,
+        [
+            (
+                11,
+                "Data Engineer",
+                "Acme",
+                "Data",
+                "2026-09-01T00:00:00",
+                "USA",
+                None,
+                "First board",
+            ),
+            (
+                12,
+                "Data Engineer",
+                "Acme",
+                "Data",
+                "2026-09-20T00:00:00",
+                "USA",
+                None,
+                "Second board",
+            ),
+        ],
+    )
+
+    rows = clean_raw_data(jobs).collect()
+
+    assert len(rows) == 1
+    assert rows[0].title == "Data Engineer"
+    assert rows[0].company_name == "Acme"
+
+
 def test_build_star_schema_links_facts_to_dimensions(spark: SparkSession) -> None:
     jobs = _bronze(
         spark,

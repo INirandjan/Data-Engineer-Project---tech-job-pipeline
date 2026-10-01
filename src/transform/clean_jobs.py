@@ -458,12 +458,28 @@ def find_latest_raw_file(raw_dir: Path) -> Path:
     return candidates[-1]
 
 
-def read_raw_jobs(spark: SparkSession, path: Path) -> DataFrame:
-    """Read the Remotive ``jobs`` array from one bronze JSON document."""
-    logger.info("Reading bronze file %s", path)
-    raw = spark.read.option("multiLine", "true").json(path.as_posix())
+def read_raw_jobs(spark: SparkSession, raw_dir: Path) -> DataFrame:
+    """Read every bronze JSON document under ``raw_dir`` in one Spark scan.
+
+    Each file is a single pretty-printed object with a ``jobs`` array.
+    ``recursiveFileLookup`` picks up every ``*.json`` file, including a
+    merged multi-source extract and older single-source landings.
+    """
+    if not raw_dir.is_dir():
+        raise RawDataNotFoundError(f"Bronze directory does not exist: {raw_dir}")
+    json_files = [path for path in raw_dir.glob("*.json") if path.is_file()]
+    if not json_files:
+        raise RawDataNotFoundError(
+            f"No files matching {RAW_FILE_PATTERN} in {raw_dir}"
+        )
+    logger.info("Reading %s bronze file(s) from %s", len(json_files), raw_dir)
+    raw = (
+        spark.read.option("multiLine", "true")
+        .option("recursiveFileLookup", "true")
+        .json(raw_dir.as_posix())
+    )
     if "jobs" not in raw.columns:
-        raise JobTransformError(f"{path.name} does not contain a jobs array")
+        raise JobTransformError(f"{raw_dir} does not contain a jobs array")
     return raw.select(F.explode("jobs").alias("job")).select("job.*")
 
 
@@ -500,11 +516,13 @@ def _publication_timestamp(jobs: DataFrame) -> Column:
         return column.cast("timestamp")
 
     text = column.cast("string")
+    # Offsets and fractional seconds make a strict pattern throw in ANSI mode.
+    normalized = F.regexp_replace(text, r"(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})$", "")
     return F.coalesce(
-        F.to_timestamp(text, "yyyy-MM-dd'T'HH:mm:ss"),
-        F.to_timestamp(text, "yyyy-MM-dd'T'HH:mm:ss.SSSSSS"),
-        F.to_timestamp(text, "yyyy-MM-dd HH:mm:ss"),
-        F.to_timestamp(text),
+        F.try_to_timestamp(normalized, F.lit("yyyy-MM-dd'T'HH:mm:ss")),
+        F.try_to_timestamp(normalized, F.lit("yyyy-MM-dd HH:mm:ss")),
+        F.try_to_timestamp(normalized, F.lit("yyyy-MM-dd")),
+        F.try_to_timestamp(text),
     )
 
 
@@ -542,23 +560,44 @@ def clean_raw_data(jobs: DataFrame) -> DataFrame:
     relevant = cleaned.where(_title_is_relevant(F.col("title"))).where(
         F.col("id").isNotNull()
     )
-    latest = Window.partitionBy("id").orderBy(
-        F.col("publication_date").desc_nulls_last()
+    return _drop_duplicate_vacancies(relevant)
+
+
+def _drop_duplicate_vacancies(jobs: DataFrame) -> DataFrame:
+    """Keep one row per job id and per title/company pair.
+
+    The newest ``publication_date`` wins. ``dropDuplicates`` then enforces
+    both keys. Spark does not preserve order inside ``dropDuplicates``, so
+    the row number runs first.
+    """
+    keyed = jobs.withColumn(
+        "_dedupe_id",
+        F.concat(F.lit("id:"), F.col("id").cast("string")),
     )
-    return (
-        relevant.withColumn("_rank", F.row_number().over(latest))
+    newest = (
+        keyed.withColumn(
+            "_rank",
+            F.row_number().over(
+                Window.partitionBy("_dedupe_id").orderBy(
+                    F.col("publication_date").desc_nulls_last()
+                )
+            ),
+        )
         .where(F.col("_rank") == 1)
         .drop("_rank")
-        .select(
-            "id",
-            "title",
-            "company_name",
-            "category",
-            "publication_date",
-            "candidate_required_location",
-            "salary",
-            "description",
-        )
+        .dropDuplicates(["_dedupe_id"])
+        .dropDuplicates(["title", "company_name"])
+        .drop("_dedupe_id")
+    )
+    return newest.select(
+        "id",
+        "title",
+        "company_name",
+        "category",
+        "publication_date",
+        "candidate_required_location",
+        "salary",
+        "description",
     )
 
 
@@ -653,13 +692,12 @@ def run_transformation(
     raw_dir: Path = DEFAULT_RAW_DIR,
     output_root: str | None = None,
 ) -> dict[str, int]:
-    """Read the latest bronze file and write silver plus gold Delta tables.
+    """Read every bronze JSON file and write silver plus gold Delta tables.
 
     Returns a mapping of output-relative path to row count.
     """
     root = output_root or resolve_delta_root()
-    latest = find_latest_raw_file(raw_dir)
-    raw_jobs = read_raw_jobs(spark, latest)
+    raw_jobs = read_raw_jobs(spark, raw_dir)
     silver = clean_raw_data(raw_jobs).cache()
     gold = build_star_schema(silver)
     tables: dict[str, DataFrame] = {

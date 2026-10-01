@@ -99,9 +99,9 @@ python -m src.transform.clean_jobs
 streamlit run src/dashboard/app.py
 ```
 
-`fetch_jobs.py` vraagt de publieke Remotive-API zonder API-sleutel en schrijft `data/raw/jobs_raw_<YYYYMMDD_HHMMSS>.json`. De standaardzoekterm is `Data Engineer`. Een andere term gaat via `--search Python` of `JOB_SEARCH_TERM` in `.env`.
+`fetch_jobs.py` vraagt Remotive, Jobicy en Arbeitnow zonder API-sleutel. De standaardrun haalt de categorieën `dev`, `data`, `software-dev` en `backend` op, volgt de Arbeitnow-pagina's, en schrijft één samengevoegd bestand `data/raw/jobs_raw_<YYYYMMDD_HHMMSS>.json`. `--search Python` blijft een losse Remotive-zoekopdracht.
 
-`clean_jobs.py` leest het nieuwste bronze-bestand en overschrijft de Delta-tabellen. Voor Azure vul je in `.env` `STORAGE_TYPE=azure`, `AZURE_STORAGE_ACCOUNT` en `AZURE_STORAGE_CONTAINER`. `AZURE_STORAGE_ACCOUNT_KEY` zet shared-key auth; op Databricks kan een managed identity die sleutel vervangen.
+`clean_jobs.py` leest alle JSON-bestanden in `data/raw/` in één Spark-scan, verwijdert dubbele vacatures op id en op titel plus bedrijfsnaam, en overschrijft de Delta-tabellen. Voor Azure vul je in `.env` `STORAGE_TYPE=azure`, `AZURE_STORAGE_ACCOUNT` en `AZURE_STORAGE_CONTAINER`. `AZURE_STORAGE_ACCOUNT_KEY` zet shared-key auth; op Databricks kan een managed identity die sleutel vervangen.
 
 Het dashboard heeft die JDK niet nodig en importeert geen modules uit `src`. Het leest Gold met DuckDB. Ontbreken de Gold-bestanden, dan schoont het de nieuwste bronze JSON in Python op. Ontbreekt ook die JSON, dan doet `app.py` zelf een `requests.get` naar de Remotive API. Mislukt die call, dan laadt `data/sample/jobs_sample.json`.
 

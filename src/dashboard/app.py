@@ -11,6 +11,7 @@ packages, so a missing ``src`` package on ``sys.path`` cannot raise
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -33,7 +34,11 @@ SAMPLE_PATH = os.path.join(PROJECT_ROOT, "data", "sample", "jobs_sample.json")
 GOLD_TABLES = ("fct_vacancies", "dim_company", "dim_location")
 
 API_URL = "https://remotive.com/api/remote-jobs"
+JOBICY_API_URL = "https://jobicy.com/api/v2/remote-jobs"
+ARBEITNOW_API_URL = "https://www.arbeitnow.com/api/job-board-api"
 SEARCH_TERM = "Data Engineer"
+LIVE_CATEGORIES = ("dev", "data", "software-dev", "backend")
+LIVE_ARBEITNOW_PAGES = 8
 TITLE_KEYWORDS = ("data", "engineer", "developer", "python")
 UNKNOWN_COMPANY = "Unknown"
 UNSPECIFIED_LOCATION = "Unspecified"
@@ -141,6 +146,7 @@ def vacancies_from_jobs(jobs: list[dict]) -> pd.DataFrame:
     )
     return (
         frame.drop_duplicates("vacancy_id", keep="first")
+        .drop_duplicates(["title", "company_name"], keep="first")
         .sort_values("publication_timestamp", ascending=False, na_position="last")
         .reset_index(drop=True)
     )
@@ -156,21 +162,17 @@ def _read_job_list(path: str | os.PathLike[str]) -> list[dict]:
     return [job for job in jobs if isinstance(job, dict)]
 
 
-def _latest_raw_file(raw_dir: str | os.PathLike[str]) -> str | None:
-    """Return the newest ``jobs_raw_<timestamp>.json`` file, if any."""
+def _raw_json_files(raw_dir: str | os.PathLike[str]) -> list[str]:
+    """Return every bronze JSON file, oldest first."""
     directory = _as_path(raw_dir)
     if not os.path.isdir(directory):
-        return None
+        return []
     names = sorted(
         name
         for name in os.listdir(directory)
-        if name.startswith("jobs_raw_")
-        and name.endswith(".json")
-        and os.path.isfile(os.path.join(directory, name))
+        if name.endswith(".json") and os.path.isfile(os.path.join(directory, name))
     )
-    if not names:
-        return None
-    return os.path.join(directory, names[-1])
+    return [os.path.join(directory, name) for name in names]
 
 
 def active_parquet_files(table_dir: str | os.PathLike[str]) -> list[str]:
@@ -289,11 +291,27 @@ def _read_gold_directory(gold_dir: str | os.PathLike[str]) -> pd.DataFrame | Non
     return _prepare_vacancies(frame)
 
 
-def _fetch_remotive(raw_dir: str | os.PathLike[str]) -> list[dict]:
-    """GET the public Remotive API and optionally land the body in ``data/raw``."""
+def _publication(value: object) -> str:
+    """Turn a unix timestamp or an API date string into text pandas can parse."""
+    if isinstance(value, (int, float)):
+        seconds = float(value)
+        if seconds > 10_000_000_000:
+            seconds /= 1000
+        return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(seconds))
+    return "" if value is None else str(value)
+
+
+def _canonical_id(source: str, native_id: object) -> int:
+    """Stable positive id so the same listing from one board stays unique."""
+    digest = hashlib.sha256(f"{source}:{native_id}".encode()).digest()
+    return int.from_bytes(digest[:8], "big") & 0x7FFFFFFFFFFFFFFF
+
+
+def _http_json(url: str, params: dict[str, str]) -> dict:
+    """GET one public job-board document. Callers catch failures."""
     response = requests.get(
-        os.environ.get("REMOTIVE_API_URL", API_URL),
-        params={"search": os.environ.get("JOB_SEARCH_TERM", SEARCH_TERM)},
+        url,
+        params=params,
         timeout=20,
         headers={
             "Accept": "application/json",
@@ -303,12 +321,88 @@ def _fetch_remotive(raw_dir: str | os.PathLike[str]) -> list[dict]:
     response.raise_for_status()
     payload = response.json()
     if not isinstance(payload, dict):
-        raise ValueError("Remotive response was not a JSON object")
-    jobs = payload.get("jobs")
-    if not isinstance(jobs, list):
-        raise ValueError("Remotive response does not contain a jobs array")
-    _save_raw(payload, raw_dir)
-    return [job for job in jobs if isinstance(job, dict)]
+        raise ValueError(f"{url} did not return a JSON object")
+    return payload
+
+
+def _fetch_live_jobs() -> list[dict]:
+    """Pull Remotive, Jobicy, and the first Arbeitnow pages without PySpark."""
+    jobs: list[dict] = []
+    for category in LIVE_CATEGORIES:
+        try:
+            payload = _http_json(
+                os.environ.get("REMOTIVE_API_URL", API_URL),
+                {"category": category, "search": category},
+            )
+            for job in payload.get("jobs") or []:
+                if isinstance(job, dict) and job.get("id") is not None and job.get("title"):
+                    copied = dict(job)
+                    copied["id"] = _canonical_id("remotive", job.get("id"))
+                    jobs.append(copied)
+        except Exception:
+            continue
+        query = {"count": "50", "tag": category}
+        if category == "dev":
+            query = {"count": "50", "industry": "dev"}
+        elif category == "data":
+            query = {"count": "50", "tag": "data"}
+        try:
+            payload = _http_json(os.environ.get("JOBICY_API_URL", JOBICY_API_URL), query)
+            for job in payload.get("jobs") or []:
+                if not isinstance(job, dict) or job.get("id") is None:
+                    continue
+                title = job.get("jobTitle") or job.get("title")
+                if not title:
+                    continue
+                jobs.append(
+                    {
+                        "id": _canonical_id("jobicy", job.get("id")),
+                        "title": title,
+                        "company_name": job.get("companyName") or job.get("company_name") or "",
+                        "category": job.get("jobIndustry") or category,
+                        "publication_date": _publication(job.get("pubDate")),
+                        "candidate_required_location": job.get("jobGeo") or "",
+                        "salary": job.get("salary") or "",
+                        "description": job.get("jobDescription") or "",
+                    }
+                )
+        except Exception:
+            continue
+
+    for page in range(1, LIVE_ARBEITNOW_PAGES + 1):
+        try:
+            payload = _http_json(
+                os.environ.get("ARBEITNOW_API_URL", ARBEITNOW_API_URL),
+                {"page": str(page)},
+            )
+        except Exception:
+            break
+        batch = payload.get("data") if isinstance(payload.get("data"), list) else []
+        if not batch:
+            break
+        for job in batch:
+            if not isinstance(job, dict) or not job.get("title"):
+                continue
+            native_id = job.get("slug") or job.get("url") or job.get("title")
+            tags = job.get("tags") if isinstance(job.get("tags"), list) else []
+            jobs.append(
+                {
+                    "id": _canonical_id("arbeitnow", native_id),
+                    "title": job.get("title"),
+                    "company_name": job.get("company_name") or "",
+                    "category": str(tags[0]) if tags else "dev",
+                    "publication_date": _publication(job.get("created_at")),
+                    "candidate_required_location": job.get("location") or "",
+                    "salary": "",
+                    "description": job.get("description") or "",
+                }
+            )
+        links = payload.get("links") if isinstance(payload.get("links"), dict) else {}
+        if not links.get("next"):
+            break
+    if not jobs:
+        raise ValueError("Remotive, Jobicy, and Arbeitnow returned no listings")
+    return jobs
 
 
 def _save_raw(payload: dict, raw_dir: str | os.PathLike[str]) -> None:
@@ -352,9 +446,11 @@ def resolve_vacancies(
             return frame, source
 
     try:
-        raw_file = _latest_raw_file(raw_dir)
-        if raw_file is not None:
-            frame = vacancies_from_jobs(_read_job_list(raw_file))
+        raw_jobs: list[dict] = []
+        for raw_file in _raw_json_files(raw_dir):
+            raw_jobs.extend(_read_job_list(raw_file))
+        if raw_jobs:
+            frame = vacancies_from_jobs(raw_jobs)
             if not frame.empty:
                 return frame, SOURCE_RAW
     except Exception:
@@ -362,8 +458,10 @@ def resolve_vacancies(
 
     if allow_fetch:
         try:
-            frame = vacancies_from_jobs(_fetch_remotive(raw_dir))
+            jobs = _fetch_live_jobs()
+            frame = vacancies_from_jobs(jobs)
             if not frame.empty:
+                _save_raw({"job-count": len(jobs), "jobs": jobs}, raw_dir)
                 return frame, SOURCE_LIVE
         except Exception:
             pass
@@ -448,7 +546,9 @@ def _source_caption(source: str) -> str:
             "Gold Parquet-bestanden, gelezen met DuckDB. Bron: Remotive."
         ),
         SOURCE_RAW: "Nieuwste bronze JSON, in Python opgeschoond. Bron: Remotive.",
-        SOURCE_LIVE: "Live opgehaald bij de Remotive API en in Python opgeschoond.",
+        SOURCE_LIVE: (
+            "Live opgehaald bij Remotive, Jobicy en Arbeitnow, daarna in Python opgeschoond."
+        ),
         SOURCE_SAMPLE: (
             "Demo-set uit data/sample, omdat er nog geen gold- of bronze-data is."
         ),

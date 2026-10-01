@@ -13,8 +13,12 @@ from src.extract.fetch_jobs import (
     JobApiError,
     JobStorageError,
     build_raw_output_path,
+    collect_catalog,
     fetch_jobs,
     main,
+    normalize_arbeitnow_job,
+    normalize_jobicy_job,
+    normalize_remotive_job,
     save_raw_response,
 )
 
@@ -170,6 +174,115 @@ def test_main_returns_error_code_when_api_fails(
     )
 
     assert main(["--search", "Data Engineer"]) == 1
+
+
+def test_normalize_maps_remotive_jobicy_and_arbeitnow() -> None:
+    remotive = normalize_remotive_job(
+        {
+            "id": 9,
+            "title": "Data Engineer",
+            "company_name": "Acme",
+            "category": "Data",
+            "publication_date": "2026-09-02T00:00:00",
+            "candidate_required_location": "Europe",
+            "salary": "",
+            "description": "<p>Pipelines</p>",
+            "url": "https://remotive.com/job/9",
+        },
+        "data",
+    )
+    jobicy = normalize_jobicy_job(
+        {
+            "id": 3,
+            "jobTitle": "Backend Engineer",
+            "companyName": "Jobicy Co",
+            "jobIndustry": "engineering",
+            "jobGeo": "Worldwide",
+            "jobDescription": "APIs",
+            "pubDate": "2026-09-03T00:00:00",
+            "url": "https://jobicy.com/job/3",
+        },
+        "backend",
+    )
+    arbeitnow = normalize_arbeitnow_job(
+        {
+            "slug": "backend-developer-acme",
+            "title": "Backend Developer",
+            "company_name": "Acme",
+            "tags": ["php", "backend"],
+            "location": "Berlin",
+            "created_at": 1_780_000_000,
+            "description": "Services",
+            "url": "https://www.arbeitnow.com/jobs/backend-developer-acme",
+        },
+        "backend",
+    )
+    assert remotive is not None and remotive["source"] == "remotive"
+    assert jobicy is not None and jobicy["title"] == "Backend Engineer"
+    assert arbeitnow is not None and arbeitnow["category"] == "php"
+    assert arbeitnow["publication_date"].startswith("2026-")
+    assert len({remotive["id"], jobicy["id"], arbeitnow["id"]}) == 3
+
+
+def test_catalog_keeps_rows_when_one_source_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _fake_get(_session: object, url: str, _params: object, _timeout: object) -> dict:
+        if "arbeitnow" in url:
+            raise JobApiError("arbeitnow down")
+        if "jobicy" in url:
+            return {
+                "jobs": [
+                    {
+                        "id": 3,
+                        "jobTitle": "Backend Engineer",
+                        "companyName": "Jobicy Co",
+                        "jobIndustry": "engineering",
+                        "jobGeo": "Europe",
+                        "jobDescription": "APIs",
+                        "pubDate": "2026-09-03T00:00:00",
+                    }
+                ]
+            }
+        return {
+            "jobs": [
+                {
+                    "id": 9,
+                    "title": "Data Engineer",
+                    "company_name": "Remotive Co",
+                    "category": "Data",
+                    "publication_date": "2026-09-02T00:00:00",
+                    "candidate_required_location": "Europe",
+                    "salary": "",
+                    "description": "Pipelines",
+                }
+            ]
+        }
+
+    monkeypatch.setattr("src.extract.fetch_jobs._get_json", _fake_get)
+    payload = collect_catalog(session=requests.Session(), pause_seconds=0)
+    sources = {job["source"] for job in payload["jobs"]}
+    assert sources == {"remotive", "jobicy"}
+    assert payload["job-count"] == 2
+
+
+def test_main_without_search_writes_the_merged_catalog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = {"job-count": 2, "jobs": [{"id": 1, "title": "Data Engineer"}]}
+
+    monkeypatch.setattr("src.extract.fetch_jobs.collect_catalog", lambda **_kwargs: body)
+    monkeypatch.setattr(
+        "src.extract.fetch_jobs.load_settings",
+        lambda: {
+            "api_url": "https://example.test/jobs",
+            "search_term": "Data Engineer",
+        },
+    )
+
+    assert main(["--output-dir", str(tmp_path)]) == 0
+    written = list(tmp_path.glob("jobs_raw_*.json"))
+    assert len(written) == 1
+    assert json.loads(written[0].read_text(encoding="utf-8")) == body
 
 
 def test_main_rejects_empty_search(monkeypatch: pytest.MonkeyPatch) -> None:
